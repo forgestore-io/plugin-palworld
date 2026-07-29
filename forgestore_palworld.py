@@ -26,9 +26,8 @@ import sys
 from typing import Optional
 
 # ─── CONFIG ──────────────────────────────────────────────────────────────────
-FORGESTORE_API_KEY   = "YOUR_API_KEY"          # From forgestore.net/portal → API Keys
-FORGESTORE_STORE_ID  = "YOUR_STORE_ID"         # From forgestore.net/portal → Settings
-FORGESTORE_API_URL   = "https://forgestore.net/api/v1"
+FORGESTORE_SECRET    = "YOUR_SECRET_KEY"       # Store Settings → Developers → API Keys
+FORGESTORE_API_URL   = "https://forgestore.net/api/plugin"
 
 PALWORLD_HOST        = "http://127.0.0.1"      # Your Palworld server host
 PALWORLD_PORT        = 8212                    # RESTAPIPort from PalWorldSettings.ini
@@ -47,9 +46,9 @@ log = logging.getLogger("ForgeStore")
 
 PALWORLD_BASE = f"{PALWORLD_HOST}:{PALWORLD_PORT}/v1"
 FORGE_HEADERS = {
-    "Authorization": f"Bearer {FORGESTORE_API_KEY}",
+    "X-ForgeStore-Secret": FORGESTORE_SECRET,
     "Content-Type": "application/json",
-    "User-Agent": "ForgeStore-Palworld/1.0.0",
+    "User-Agent": "ForgeStore-Palworld/1.1.0",
 }
 
 
@@ -112,35 +111,58 @@ def execute_command(command: str, player_name: str, package_name: str, order_id:
 # ─── ForgeStore API ───────────────────────────────────────────────────────────
 
 def fetch_pending_commands() -> list[dict]:
-    """Fetch pending commands from ForgeStore API."""
-    try:
-        resp = requests.get(
-            f"{FORGESTORE_API_URL}/queue",
-            headers=FORGE_HEADERS,
-            params={"store_id": FORGESTORE_STORE_ID},
-            timeout=15
-        )
-        if resp.status_code == 200:
-            data = resp.json()
-            return data.get("data", []) or []
-        elif resp.status_code == 401:
-            log.error("❌ Invalid API key. Check FORGESTORE_API_KEY.")
+    """Suit le vrai flux API: /queue -> /queue/offline (+ online/{player})."""
+    def api_get(path):
+        try:
+            r = requests.get(f"{FORGESTORE_API_URL}{path}", headers=FORGE_HEADERS, timeout=15)
+            if r.status_code == 401:
+                log.error("❌ Invalid secret key. Check FORGESTORE_SECRET.")
+                return None
+            return r.json() if r.status_code == 200 else None
+        except Exception as e:
+            log.warning(f"ForgeStore API error on {path}: {e}")
+            return None
+
+    q = api_get("/queue")
+    if not isinstance(q, dict):
         return []
-    except Exception as e:
-        log.warning(f"ForgeStore API error: {e}")
-        return []
+
+    out = []
+    def normalize(c, fallback_name=""):
+        p = c.get("player") or {}
+        return {
+            "id":          int(c.get("id", 0) or 0),
+            "command":     c.get("command", "") or "",
+            "player_name": p.get("name") or fallback_name or "",
+            "player_uuid": p.get("uuid") or "",
+            "delay":       int((c.get("conditions") or {}).get("delay", 0) or 0),
+        }
+
+    if (q.get("meta") or {}).get("execute_offline"):
+        off = api_get("/queue/offline")
+        if isinstance(off, dict):
+            out.extend(normalize(c) for c in (off.get("commands") or []))
+
+    for p in (q.get("players") or []):
+        name = (p or {}).get("name")
+        if not name:
+            continue
+        on = api_get(f"/queue/online/{name}")
+        if isinstance(on, dict):
+            out.extend(normalize(c, name) for c in (on.get("commands") or []))
+    return out
 
 
 def acknowledge_command(command_id: int) -> bool:
-    """Acknowledge that a command was executed."""
+    """Confirme la livraison (DELETE /queue avec {"ids": [...]})."""
     try:
-        resp = requests.post(
-            f"{FORGESTORE_API_URL}/queue/{command_id}/ack",
+        resp = requests.delete(
+            f"{FORGESTORE_API_URL}/queue",
             headers=FORGE_HEADERS,
-            json={"store_id": FORGESTORE_STORE_ID},
+            json={"ids": [int(command_id)]},
             timeout=10
         )
-        return resp.status_code == 200
+        return resp.status_code in (200, 204)
     except Exception as e:
         log.warning(f"Ack error: {e}")
         return False
@@ -149,16 +171,10 @@ def acknowledge_command(command_id: int) -> bool:
 def test_connection() -> bool:
     """Test ForgeStore API connection."""
     try:
-        resp = requests.get(
-            f"{FORGESTORE_API_URL}/stats",
-            headers=FORGE_HEADERS,
-            params={"store_id": FORGESTORE_STORE_ID},
-            timeout=8
-        )
-        return resp.status_code == 200
+        r = requests.get(f"{FORGESTORE_API_URL}/information", headers=FORGE_HEADERS, timeout=10)
+        return r.status_code == 200
     except Exception:
         return False
-
 
 # ─── Main delivery loop ───────────────────────────────────────────────────────
 
@@ -189,12 +205,11 @@ def process_commands(commands: list[dict], online_players: list[str]):
 
 
 def main():
-    log.info("ForgeStore Palworld Plugin v1.0.0 starting...")
-    log.info(f"Store ID: {FORGESTORE_STORE_ID}")
+    log.info("ForgeStore Palworld Plugin v1.1.0 starting...")
     log.info(f"Palworld: {PALWORLD_BASE}")
 
     if not test_connection():
-        log.error("❌ Cannot connect to ForgeStore API. Check API key and store ID.")
+        log.error("❌ Cannot connect to ForgeStore API. Check FORGESTORE_SECRET.")
         sys.exit(1)
     log.info("✅ Connected to ForgeStore API")
 
